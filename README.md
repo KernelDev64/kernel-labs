@@ -1,2 +1,2 @@
 # Kernel-labs
-A collection of Python scripts for learning, automation, and experimentation.
+A collection of Python and Javascripts codes for learning, automation, and experimentation.
