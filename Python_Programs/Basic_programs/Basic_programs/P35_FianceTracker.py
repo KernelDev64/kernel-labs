@@ -1,0 +1,302 @@
+import sqlite3
+import bcrypt
+import re
+import getpass
+import os
+import csv
+from datetime import datetime
+from colorama import Fore, Style, init
+
+# Initialize Colorama for terminal colors
+init(autoreset=True)
+
+# -----------------------------
+# Configuration & Database
+# -----------------------------
+DB_NAME = "finance_app.db"
+INCOME = "Income"
+EXPENSE = "Expense"
+
+class FinanceDB:
+    def __init__(self, db_name):
+        self.db_name = db_name
+        self.create_tables()
+
+    def query(self, sql, params=(), commit=False, fetch=False):
+        with sqlite3.connect(self.db_name) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            if commit:
+                conn.commit()
+            return cursor.fetchall() if fetch else cursor.lastrowid
+
+    def create_tables(self):
+        self.query("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password BLOB NOT NULL,
+                security_question TEXT NOT NULL,
+                security_answer BLOB NOT NULL
+            )
+        """, commit=True)
+
+        self.query("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date TEXT,
+                type TEXT,
+                category TEXT,
+                amount REAL CHECK(amount>=0),
+                note TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """, commit=True)
+
+        self.query("""
+            CREATE TABLE IF NOT EXISTS budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                category TEXT,
+                monthly_limit REAL CHECK(monthly_limit>=0),
+                UNIQUE(user_id, category),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """, commit=True)
+
+db = FinanceDB(DB_NAME)
+
+# -----------------------------
+# Utility Helpers
+# -----------------------------
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def is_strong_password(password):
+    return (len(password) >= 8 and
+            re.search(r"[A-Z]", password) and
+            re.search(r"[a-z]", password) and
+            re.search(r"[0-9]", password))
+
+def get_input(prompt, required=True):
+    val = input(prompt).strip()
+    if not val and required:
+        print(Fore.RED + "⚠ Field cannot be empty.")
+        return get_input(prompt, required)
+    return val
+
+# -----------------------------
+# Auth & Recovery
+# -----------------------------
+
+def register():
+    username = get_input("New username: ").lower()
+    password = getpass.getpass("New password: ")
+    
+    if not is_strong_password(password):
+        print(Fore.RED + "⚠ Weak password! (Min 8 chars, 1 Uppercase, 1 Number)")
+        input("Press Enter...")
+        return
+
+    question = get_input("Security Question: ")
+    answer = getpass.getpass("Answer: ").lower()
+
+    try:
+        db.query("""INSERT INTO users (username, password, security_question, security_answer) 
+                 VALUES (?, ?, ?, ?)""", 
+                 (username, bcrypt.hashpw(password.encode(), bcrypt.gensalt()), 
+                  question, bcrypt.hashpw(answer.encode(), bcrypt.gensalt())), commit=True)
+        print(Fore.GREEN + "✔ Account created!")
+    except sqlite3.IntegrityError:
+        print(Fore.RED + "⚠ Username already exists.")
+    input("Press Enter...")
+
+def login():
+    username = get_input("Username: ").lower()
+    password = getpass.getpass("Password: ")
+    
+    user = db.query("SELECT id, password FROM users WHERE username=?", (username,), fetch=True)
+    
+    if user and bcrypt.checkpw(password.encode(), user[0][1]):
+        print(Fore.GREEN + "✔ Login successful!")
+        return user[0][0]
+    
+    print(Fore.RED + "⚠ Access denied.")
+    input("Press Enter...")
+    return None
+
+def recover_password():
+    username = get_input("Enter username for recovery: ").lower()
+    user_data = db.query("SELECT security_question, security_answer FROM users WHERE username=?", (username,), fetch=True)
+
+    if not user_data:
+        print(Fore.RED + "⚠ User not found.")
+        input("Press Enter...")
+        return
+
+    question, hashed_answer = user_data[0]
+    print(f"\nSecurity Question: {Fore.CYAN}{question}")
+    answer_attempt = getpass.getpass("Your Answer: ").lower()
+
+    if bcrypt.checkpw(answer_attempt.encode(), hashed_answer):
+        print(Fore.GREEN + "✔ Identity verified!")
+        new_password = getpass.getpass("Enter new password: ")
+        
+        if is_strong_password(new_password):
+            new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt())
+            db.query("UPDATE users SET password=? WHERE username=?", (new_hash, username), commit=True)
+            print(Fore.GREEN + "✔ Password updated successfully!")
+        else:
+            print(Fore.RED + "⚠ Password too weak.")
+    else:
+        print(Fore.RED + "⚠ Incorrect answer.")
+    input("Press Enter...")
+
+# -----------------------------
+# Finance Logic
+# -----------------------------
+
+def add_transaction(user_id, t_type):
+    print(f"\n--- Add {t_type} ---")
+    category = get_input("Category: ").title()
+    try:
+        amount = float(get_input("Amount: "))
+    except ValueError:
+        print(Fore.RED + "⚠ Numbers only.")
+        return
+
+    note = input("Note (optional): ")
+    date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    db.query("INSERT INTO transactions (user_id, date, type, category, amount, note) VALUES (?,?,?,?,?,?)",
+             (user_id, date, t_type, category, amount, note), commit=True)
+    
+    if t_type == EXPENSE:
+        check_budget(user_id, category)
+    
+    print(Fore.GREEN + f"✔ Recorded.")
+    input("Press Enter...")
+
+def check_budget(user_id, category):
+    month = datetime.now().strftime("%Y-%m")
+    spent = db.query("""SELECT SUM(amount) FROM transactions 
+                     WHERE user_id=? AND category=? AND type='Expense' AND strftime('%Y-%m', date)=?""",
+                     (user_id, category, month), fetch=True)[0][0] or 0
+    
+    budget = db.query("SELECT monthly_limit FROM budgets WHERE user_id=? AND category=?", 
+                      (user_id, category), fetch=True)
+    
+    if budget:
+        limit = budget[0][0]
+        perc = (spent / limit) * 100
+        print(f"\nBudget Status for {category}: {spent:.2f} / {limit:.2f} ({perc:.1f}%)")
+        if spent > limit:
+            print(Fore.RED + "‼ BUDGET EXCEEDED!")
+        elif perc > 80:
+            print(Fore.YELLOW + "⚠ Over 80% used.")
+
+def view_total_balance(user_id):
+    """Calculates Net Balance = Total Income - Total Expense"""
+    total_income = db.query("SELECT SUM(amount) FROM transactions WHERE user_id=? AND type=?", (user_id, INCOME), fetch=True)[0][0] or 0
+    total_expense = db.query("SELECT SUM(amount) FROM transactions WHERE user_id=? AND type=?", (user_id, EXPENSE), fetch=True)[0][0] or 0
+    
+    balance = total_income - total_expense
+    
+    print(f"\n{Fore.CYAN}--- Financial Snapshot ---")
+    print(f"Total Income  : {Fore.GREEN}{total_income:,.2f}")
+    print(f"Total Expense : {Fore.RED}{total_expense:,.2f}")
+    print("-" * 25)
+    
+    balance_color = Fore.GREEN if balance >= 0 else Fore.RED
+    print(f"Net Balance   : {balance_color}{balance:,.2f}")
+    input("\nPress Enter to return...")
+
+def view_all_transactions(user_id):
+    rows = db.query("SELECT date, type, category, amount, note FROM transactions WHERE user_id=? ORDER BY date DESC", 
+                    (user_id,), fetch=True)
+    
+    print(f"\n{'Date':<20} | {'Type':<8} | {'Category':<15} | {'Amount':<10} | {'Note'}")
+    print("-" * 85)
+    for r in rows:
+        color = Fore.GREEN if r[1] == INCOME else Fore.RED
+        print(f"{r[0][:16]:<20} | {color}{r[1]:<8}{Style.RESET_ALL} | {r[2]:<15} | {r[3]:<10.2f} | {r[4]}")
+    input("\nPress Enter to return...")
+
+def monthly_report(user_id):
+    month = datetime.now().strftime("%Y-%m")
+    print(f"\n--- Monthly Summary: {month} ---")
+    
+    summary = db.query("""SELECT category, SUM(amount) FROM transactions 
+                       WHERE user_id=? AND type='Expense' AND strftime('%Y-%m', date)=?
+                       GROUP BY category""", (user_id, month), fetch=True)
+    
+    if not summary:
+        print("No expenses logged for this month.")
+    else:
+        for cat, total in summary:
+            print(f"{cat:<15}: ${total:>10.2f}")
+    input("\nPress Enter...")
+
+# -----------------------------
+# Main Menus
+# -----------------------------
+
+def user_menu(user_id):
+    while True:
+        clear_screen()
+        print(Fore.CYAN + "=== USER DASHBOARD ===")
+        print("1) Add Income")
+        print("2) Add Expense")
+        print("3) View History")
+        print("4) Set Budget")
+        print("5) Monthly Summary")
+        print("6) Total Balance")
+        print("7) Logout")
+        
+        choice = input("\nChoice: ")
+        
+        if choice == "1": add_transaction(user_id, INCOME)
+        elif choice == "2": add_transaction(user_id, EXPENSE)
+        elif choice == "3": view_all_transactions(user_id)
+        elif choice == "4":
+            cat = get_input("Category: ").title()
+            try:
+                limit = float(get_input("Monthly Limit: "))
+                db.query("INSERT OR REPLACE INTO budgets (user_id, category, monthly_limit) VALUES (?,?,?)",
+                         (user_id, cat, limit), commit=True)
+                print(Fore.GREEN + "Budget updated.")
+            except ValueError:
+                print(Fore.RED + "Invalid number.")
+            input("Press Enter...")
+        elif choice == "5": monthly_report(user_id)
+        elif choice == "6": view_total_balance(user_id)
+        elif choice == "7": break
+
+def main():
+    while True:
+        clear_screen()
+        print(Fore.YELLOW + "------KernelFinance Pro--------")
+        print("1) Register")
+        print("2) Login")
+        print("3) Recover Password")
+        print("4) Exit")
+        
+        choice = input("\nChoice: ")
+        
+        if choice == "1":
+            register()
+        elif choice == "2":
+            uid = login()
+            if uid:
+                user_menu(uid)
+        elif choice == "3":
+            recover_password()
+        elif choice == "4":
+            print(Fore.GREEN + "Goodbye!")
+            break
+
+if __name__ == "__main__":
+    main()
